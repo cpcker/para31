@@ -1,16 +1,10 @@
-import logging
 import os
 from enum import Enum
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import List
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
 
-logger = logging.getLogger(__name__)
-
-
-class TradingMode(str, Enum):
-    PAPER = "PAPER"
-    LIVE = "LIVE"
+load_dotenv()
 
 
 class BrokerType(str, Enum):
@@ -19,123 +13,87 @@ class BrokerType(str, Enum):
     IBKR = "IBKR"
 
 
-class BrokerConfig(BaseModel):
-    """Broker connection and credential settings loaded from environment variables."""
-
-    broker_type: BrokerType = Field(default=BrokerType.ALPACA)
-    trading_mode: TradingMode = Field(default=TradingMode.PAPER)
-    api_key: str = Field(default="")
-    api_secret: str = Field(default="")
-    passphrase: Optional[str] = Field(default=None)
-    host: str = Field(default="127.0.0.1")
-    port: int = Field(default=7497)
-
-    @field_validator("api_key", "api_secret")
-    def validate_credentials_if_live(cls, v: str, info) -> str:
-        """Enforces present credentials when live mode is selected."""
-        # Note: Access context or environment directly if validation rules cross fields
-        return v
+class TradingMode(str, Enum):
+    LIVE = "LIVE"
+    PAPER = "PAPER"
 
 
-class TelegramConfig(BaseModel):
-    """Telegram alert configuration."""
-
-    bot_token: Optional[str] = Field(default=None)
-    chat_id: Optional[str] = Field(default=None)
-
-    @property
-    def is_enabled(self) -> bool:
-        return bool(self.bot_token and self.chat_id)
+class MarketType(str, Enum):
+    SPOT = "SPOT"
+    FUTURES = "FUTURES"
 
 
-class RiskConfig(BaseModel):
-    """Core risk guardrail and position sizing parameters."""
-
-    max_drawdown_pct: float = Field(default=0.05, ge=0.01, le=0.50)
-    risk_per_trade_pct: float = Field(default=0.015, ge=0.001, le=0.10)
-    max_daily_trades: int = Field(default=20, ge=1)
-    max_asset_concentration_pct: float = Field(default=0.25, ge=0.05, le=1.00)
-    kelly_fraction: float = Field(default=0.5, ge=0.1, le=1.0)
-    atr_multiplier: float = Field(default=2.0, ge=0.5, le=5.0)
-    atr_period: int = Field(default=14, ge=2)
-
-
-class StrategyConfig(BaseModel):
-    name: str
-    enabled: bool = True
-    weight: float = 1.0
-    parameters: Dict[str, Any] = Field(default_factory=dict)
+@dataclass
+class BrokerConfig:
+    broker_type: BrokerType = BrokerType.BINANCE
+    trading_mode: TradingMode = TradingMode.LIVE
+    market_type: MarketType = MarketType.SPOT
+    api_key: str = ""
+    api_secret: str = ""
+    futures_leverage: int = 1
+    trading_pairs: List[str] = field(
+        default_factory=lambda: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    )
+    host: str = "127.0.0.1"
+    port: int = 7497
 
 
-class AppConfig(BaseModel):
-    """Root configuration container uniting broker, risk, and alert settings."""
+@dataclass
+class RiskConfig:
+    risk_per_trade_pct: float = 0.02
+    max_drawdown_pct: float = 0.15
+    max_daily_trades: int = 10
 
-    broker: BrokerConfig
-    risk: RiskConfig
-    telegram: TelegramConfig
-    allocated_capital: float = Field(default=100000.0, gt=0.0)
 
-    @classmethod
-    def load_from_env(cls, env_path: str = ".env") -> "AppConfig":
-        """Parses .env file, coerces types, and runs validation checks."""
-        if os.path.exists(env_path):
-            load_dotenv(dotenv_path=env_path, override=True)
-            logger.info(f"Loaded environment variables from {env_path}")
-        else:
-            logger.warning(
-                f"No {env_path} file found. Falling back to environment defaults."
-            )
+@dataclass
+class TelegramConfig:
+    is_enabled: bool = True
+    bot_token: str = ""
+    chat_id: str = ""
 
-        trading_mode_str = os.getenv("TRADING_MODE", "PAPER").upper()
-        broker_type_str = os.getenv("BROKER_TYPE", "ALPACA").upper()
 
-        broker_cfg = BrokerConfig(
-            broker_type=BrokerType(broker_type_str),
-            trading_mode=TradingMode(trading_mode_str),
+@dataclass
+class AppConfig:
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    allocated_capital: float = 100.0
+
+
+def get_config() -> AppConfig:
+    broker_type_str = os.getenv("BROKER_TYPE", "BINANCE").upper()
+    trading_mode_str = os.getenv("TRADING_MODE", "LIVE").upper()
+    market_type_str = os.getenv("MARKET_TYPE", "SPOT").upper()
+
+    # Parse TRADING_PAIRS environment string into clean uppercase list
+    pairs_str = os.getenv("TRADING_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
+    trading_pairs_list = [p.strip().upper() for p in pairs_str.split(",") if p.strip()]
+
+    return AppConfig(
+        broker=BrokerConfig(
+            broker_type=BrokerType[broker_type_str]
+            if broker_type_str in BrokerType.__members__
+            else BrokerType.BINANCE,
+            trading_mode=TradingMode[trading_mode_str]
+            if trading_mode_str in TradingMode.__members__
+            else TradingMode.LIVE,
+            market_type=MarketType[market_type_str]
+            if market_type_str in MarketType.__members__
+            else MarketType.SPOT,
             api_key=os.getenv("API_KEY", ""),
             api_secret=os.getenv("API_SECRET", ""),
-            passphrase=os.getenv("API_PASSPHRASE") or None,
-            host=os.getenv("BROKER_HOST", "127.0.0.1"),
-            port=int(os.getenv("BROKER_PORT", "7497")),
-        )
-
-        # Enforce API Key presence for Live mode
-        if broker_cfg.trading_mode == TradingMode.LIVE:
-            if not broker_cfg.api_key or not broker_cfg.api_secret:
-                raise ValueError(
-                    "CRITICAL: LIVE trading mode requires valid API_KEY and API_SECRET in .env"
-                )
-
-        telegram_cfg = TelegramConfig(
-            bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
-            chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
-        )
-
-        capital_str = os.getenv("ALLOCATED_CAPITAL", "100000.0")
-
-        app_config = cls(
-            broker=broker_cfg,
-            risk=RiskConfig(),
-            telegram=telegram_cfg,
-            allocated_capital=float(capital_str),
-        )
-
-        logger.info(
-            f"Configuration initialized successfully: [{app_config.broker.broker_type.value} | "
-            f"{app_config.broker.trading_mode.value} | Capital: ${app_config.allocated_capital:,.2f}]"
-        )
-        return app_config
-
-
-# Global config factory helper
-def get_config() -> AppConfig:
-    return AppConfig.load_from_env()
-
-
-if __name__ == "__main__":
-    # Test loader directly
-    config = get_config()
-    print("Broker:", config.broker.broker_type)
-    print("Mode:", config.broker.trading_mode)
-    print("Capital:", config.allocated_capital)
-    print("Telegram Enabled:", config.telegram.is_enabled)
+            futures_leverage=int(os.getenv("FUTURES_LEVERAGE", "1")),
+            trading_pairs=trading_pairs_list,
+        ),
+        risk=RiskConfig(
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.02")),
+            max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.15")),
+            max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "10")),
+        ),
+        telegram=TelegramConfig(
+            is_enabled=os.getenv("TELEGRAM_ENABLED", "true").lower() == "true",
+            bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+        ),
+        allocated_capital=float(os.getenv("ALLOCATED_CAPITAL", "100.0")),
+    )

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -19,7 +19,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
-from config import BrokerConfig, BrokerType, TradingMode
+from config import BrokerConfig, BrokerType, MarketType, TradingMode
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class AlpacaBroker(BaseBroker):
         elif "d" in timeframe:
             minutes_per_bar = 1440
 
-        start_time = datetime.utcnow() - timedelta(
+        start_time = datetime.now(timezone.utc) - timedelta(
             minutes=minutes_per_bar * (limit + 20)
         )
 
@@ -190,9 +190,7 @@ class AlpacaBroker(BaseBroker):
                 stop_loss=sl_req,
             )
 
-        order = await asyncio.to_thread(
-            self.trading_client.submit_order, order_data
-        )
+        order = await asyncio.to_thread(self.trading_client.submit_order, order_data)
         logger.info(
             f"Alpaca Order Submitted: {order.side.value.upper()} {order.qty} {order.symbol} [ID: {order.id}]"
         )
@@ -215,11 +213,13 @@ class AlpacaBroker(BaseBroker):
 
 
 class BinanceBroker(BaseBroker):
-    """Binance Crypto Exchange Broker Implementation."""
+    """Unified Binance Broker supporting Spot & Futures dynamically from config."""
 
     def __init__(self, config: BrokerConfig):
         self.config = config
         self.client = None
+        self.is_futures = config.market_type == MarketType.FUTURES
+        self.leverage = getattr(config, "futures_leverage", 1)
 
         raw_key = str(config.api_key or "")
         raw_secret = str(config.api_secret or "")
@@ -241,14 +241,34 @@ class BinanceBroker(BaseBroker):
             api_secret=self.api_secret,
             testnet=testnet,
         )
-        logger.info(f"Connected to Binance [{'Testnet' if testnet else 'Live'}]")
+
+        mode_label = f"Futures ({self.leverage}x Leverage)" if self.is_futures else "Spot"
+        logger.info(f"Connected to Binance {mode_label} [{'Testnet' if testnet else 'Live'}]")
+
+        if self.is_futures:
+            try:
+                await self.client.futures_change_position_mode(dualSidePosition="false")
+            except Exception:
+                pass
+
+            for sym in self.config.trading_pairs:
+                try:
+                    await self.client.futures_change_leverage(symbol=sym, leverage=self.leverage)
+                    await self.client.futures_change_margin_type(symbol=sym, marginType="CROSSED")
+                except Exception as e:
+                    if "-4046" in str(e) or "No need to change margin type" in str(e):
+                        pass
+                    else:
+                        logger.warning(f"Could not initialize futures leverage for {sym}: {e}")
 
     async def _get_all_asset_prices(self) -> Dict[str, float]:
-        """Fetches all market tickers to accurately map asset conversion rates."""
         if not self.client:
             return {}
         try:
-            tickers = await self.client.get_symbol_ticker()
+            if self.is_futures:
+                tickers = await self.client.futures_symbol_ticker()
+            else:
+                tickers = await self.client.get_symbol_ticker()
             return {t["symbol"]: float(t["price"]) for t in tickers}
         except Exception:
             return {}
@@ -257,99 +277,129 @@ class BinanceBroker(BaseBroker):
         if not self.client:
             return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
 
-        acc = await self.client.get_account()
-        price_map = await self._get_all_asset_prices()
+        if self.is_futures:
+            try:
+                acc = await self.client.futures_account()
+                total_margin = float(acc.get("totalMarginBalance", 0.0))
+                available_balance = float(acc.get("availableBalance", 0.0))
+                return {
+                    "equity": total_margin,
+                    "cash": available_balance,
+                    "buying_power": available_balance * self.leverage,
+                }
+            except Exception as e:
+                logger.error(f"Error fetching futures account balance: {e}")
+                return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
+        else:
+            acc = await self.client.get_account()
+            price_map = await self._get_all_asset_prices()
 
-        total_equity = 0.0
-        free_fiat_stable = 0.0
+            total_equity = 0.0
+            free_fiat_stable = 0.0
 
-        for b in acc["balances"]:
-            asset = b["asset"]
-            free = float(b["free"])
-            locked = float(b["locked"])
-            total = free + locked
+            for b in acc["balances"]:
+                asset = b["asset"]
+                free = float(b["free"])
+                locked = float(b["locked"])
+                total = free + locked
 
-            if total <= 0:
-                continue
+                if total <= 0:
+                    continue
 
-            # Accumulate free base fiat/stable balance
-            if asset in ["USDC", "EUR", "USDT", "BUSD"]:
-                free_fiat_stable += free
+                if asset in ["USDC", "EUR", "USDT", "BUSD"]:
+                    free_fiat_stable += free
 
-            # Direct cash or calculate dynamic valuation against USDT/USDC/EUR
-            if asset in ["USDT", "USDC"]:
-                asset_val = total
-            elif asset == "EUR":
-                eur_usdt = price_map.get("EURUSDT", 1.08)
-                asset_val = total * eur_usdt
-            else:
-                pair_usdt = f"{asset}USDT"
-                pair_usdc = f"{asset}USDC"
-                pair_eur = f"{asset}EUR"
-
-                if pair_usdt in price_map:
-                    asset_val = total * price_map[pair_usdt]
-                elif pair_usdc in price_map:
-                    asset_val = total * price_map[pair_usdc]
-                elif pair_eur in price_map:
-                    asset_val = total * price_map[pair_eur] * price_map.get("EURUSDT", 1.08)
+                if asset in ["USDT", "USDC"]:
+                    asset_val = total
+                elif asset == "EUR":
+                    eur_usdt = price_map.get("EURUSDT", 1.08)
+                    asset_val = total * eur_usdt
                 else:
-                    asset_val = 0.0
+                    pair_usdt = f"{asset}USDT"
+                    pair_usdc = f"{asset}USDC"
+                    pair_eur = f"{asset}EUR"
 
-            total_equity += asset_val
+                    if pair_usdt in price_map:
+                        asset_val = total * price_map[pair_usdt]
+                    elif pair_usdc in price_map:
+                        asset_val = total * price_map[pair_usdc]
+                    elif pair_eur in price_map:
+                        asset_val = total * price_map[pair_eur] * price_map.get("EURUSDT", 1.08)
+                    else:
+                        asset_val = 0.0
 
-        return {
-            "equity": total_equity,
-            "cash": free_fiat_stable,
-            "buying_power": free_fiat_stable,
-        }
+                total_equity += asset_val
+
+            return {
+                "equity": total_equity,
+                "cash": free_fiat_stable,
+                "buying_power": free_fiat_stable,
+            }
 
     async def get_positions(self) -> List[Dict[str, Any]]:
-        """Returns ALL non-zero balance assets in your wallet with real-time price lookup."""
         if not self.client:
             return []
 
-        acc = await self.client.get_account()
-        price_map = await self._get_all_asset_prices()
+        if self.is_futures:
+            try:
+                pos_info = await self.client.futures_position_information()
+                positions = []
+                for pos in pos_info:
+                    amt = float(pos["positionAmt"])
+                    if amt != 0:
+                        positions.append({
+                            "symbol": pos["symbol"],
+                            "qty": abs(amt),
+                            "side": "BUY" if amt > 0 else "SELL",
+                            "entry_price": float(pos["entryPrice"]),
+                            "current_price": float(pos["markPrice"]),
+                            "unrealized_pnl": float(pos["unRealizedProfit"]),
+                        })
+                return positions
+            except Exception as e:
+                logger.error(f"Error fetching futures positions: {e}")
+                return []
+        else:
+            acc = await self.client.get_account()
+            price_map = await self._get_all_asset_prices()
 
-        positions = []
-        for b in acc["balances"]:
-            asset = b["asset"]
-            free = float(b["free"])
-            locked = float(b["locked"])
-            total = free + locked
+            positions = []
+            for b in acc["balances"]:
+                asset = b["asset"]
+                free = float(b["free"])
+                locked = float(b["locked"])
+                total = free + locked
 
-            # Display ALL assets with non-zero balances (No dust filtering)
-            if total > 0:
-                pair_usdc = f"{asset}USDC"
-                pair_usdt = f"{asset}USDT"
-                pair_eur = f"{asset}EUR"
+                if total > 0:
+                    pair_usdc = f"{asset}USDC"
+                    pair_usdt = f"{asset}USDT"
+                    pair_eur = f"{asset}EUR"
 
-                if asset in ["USDC", "USDT"]:
-                    curr_price = 1.0
-                elif asset == "EUR":
-                    curr_price = price_map.get("EURUSDT", 1.08)
-                elif pair_usdc in price_map:
-                    curr_price = price_map[pair_usdc]
-                elif pair_usdt in price_map:
-                    curr_price = price_map[pair_usdt]
-                elif pair_eur in price_map:
-                    curr_price = price_map[pair_eur]
-                else:
-                    curr_price = 0.0
+                    if asset in ["USDC", "USDT"]:
+                        curr_price = 1.0
+                    elif asset == "EUR":
+                        curr_price = price_map.get("EURUSDT", 1.08)
+                    elif pair_usdc in price_map:
+                        curr_price = price_map[pair_usdc]
+                    elif pair_usdt in price_map:
+                        curr_price = price_map[pair_usdt]
+                    elif pair_eur in price_map:
+                        curr_price = price_map[pair_eur]
+                    else:
+                        curr_price = 0.0
 
-                positions.append(
-                    {
-                        "symbol": asset,
-                        "qty": total,
-                        "side": "HOLD",
-                        "entry_price": curr_price,
-                        "current_price": curr_price,
-                        "unrealized_pnl": 0.0,
-                    }
-                )
+                    positions.append(
+                        {
+                            "symbol": asset,
+                            "qty": total,
+                            "side": "HOLD",
+                            "entry_price": curr_price,
+                            "current_price": curr_price,
+                            "unrealized_pnl": 0.0,
+                        }
+                    )
 
-        return positions
+            return positions
 
     async def get_historical_klines(
         self, symbol: str, timeframe: str = "15m", limit: int = 100
@@ -357,9 +407,16 @@ class BinanceBroker(BaseBroker):
         if not self.client:
             return pd.DataFrame()
         norm = self.normalize_symbol(symbol)
-        klines = await self.client.get_klines(
-            symbol=norm, interval=timeframe, limit=limit
-        )
+
+        if self.is_futures:
+            klines = await self.client.futures_klines(
+                symbol=norm, interval=timeframe, limit=limit
+            )
+        else:
+            klines = await self.client.get_klines(
+                symbol=norm, interval=timeframe, limit=limit
+            )
+
         cols = [
             "timestamp",
             "open",
@@ -392,23 +449,88 @@ class BinanceBroker(BaseBroker):
     ) -> Dict[str, Any]:
         if not self.client:
             raise RuntimeError("Binance client not connected.")
-        norm = self.normalize_symbol(symbol)
-        res = await self.client.create_order(
-            symbol=norm, side=side.upper(), type=order_type.upper(), quantity=qty
-        )
-        return {
-            "order_id": str(res["orderId"]),
-            "symbol": res["symbol"],
-            "status": res["status"],
-        }
 
-    async def close(self) -> None:
-        """Gracefully close Binance client connection."""
-        if self.client:
-            await self.client.close_connection()
+        norm = self.normalize_symbol(symbol)
+
+        if "BTC" in norm:
+            clean_qty = round(qty, 3 if self.is_futures else 5)
+        elif "ETH" in norm:
+            clean_qty = round(qty, 3 if self.is_futures else 4)
+        else:
+            clean_qty = round(qty, 2)
+
+        formatted_qty = f"{clean_qty:.4f}".rstrip("0").rstrip(".")
+        order_side = side.upper()
+        exit_side = "SELL" if order_side == "BUY" else "BUY"
+
+        if self.is_futures:
+            # 1. Submit Main Market Entry Order
+            res = await self.client.futures_create_order(
+                symbol=norm,
+                side=order_side,
+                type=order_type.upper(),
+                quantity=formatted_qty,
+            )
+            order_id = str(res.get("orderId", "N/A"))
+
+            price_precision = 2
+
+            # 2. Attach Conditional Stop Loss
+            if sl and sl > 0:
+                try:
+                    sl_str = f"{round(sl, price_precision):.{price_precision}f}"
+                    await self.client.futures_create_order(
+                        symbol=norm,
+                        side=exit_side,
+                        type="STOP_MARKET",
+                        stopPrice=sl_str,
+                        closePosition="true",
+                        workingType="MARK_PRICE",
+                    )
+                    logger.info(f"🛡️ Native Futures Stop Loss set for {norm} @ ${sl_str}")
+                except Exception as sl_err:
+                    logger.warning(f"Failed to set Futures Stop Loss for {norm}: {sl_err}")
+
+            # 3. Attach Conditional Take Profit
+            if tp and tp > 0:
+                try:
+                    tp_str = f"{round(tp, price_precision):.{price_precision}f}"
+                    await self.client.futures_create_order(
+                        symbol=norm,
+                        side=exit_side,
+                        type="TAKE_PROFIT_MARKET",
+                        stopPrice=tp_str,
+                        closePosition="true",
+                        workingType="MARK_PRICE",
+                    )
+                    logger.info(f"🎯 Native Futures Take Profit set for {norm} @ ${tp_str}")
+                except Exception as tp_err:
+                    logger.warning(f"Failed to set Futures Take Profit for {norm}: {tp_err}")
+
+            return {
+                "order_id": order_id,
+                "symbol": res.get("symbol", norm),
+                "status": res.get("status", "SUBMITTED"),
+            }
+        else:
+            res = await self.client.create_order(
+                symbol=norm,
+                side=order_side,
+                type=order_type.upper(),
+                quantity=formatted_qty,
+            )
+            return {
+                "order_id": str(res["orderId"]),
+                "symbol": res["symbol"],
+                "status": res["status"],
+            }
 
     async def cancel_order(self, order_id: str) -> bool:
         return True
+
+    async def close(self) -> None:
+        if self.client:
+            await self.client.close_connection()
 
 
 class IBKRBroker(BaseBroker):
