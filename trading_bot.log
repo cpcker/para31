@@ -655,3 +655,56 @@
 2026-08-28 10:42:49,646 [INFO] TradingEngine: Engine offline.
 2026-08-28 10:43:13,835 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
 2026-08-28 10:43:15,868 [INFO] TradingEngine: Dispatching hourly status report for $101.00 account equity.
+2026-08-28 11:43:31,083 [INFO] TradingEngine: Dispatching hourly status report for $101.00 account equity.
+2026-08-28 12:43:40,000 [INFO] TradingEngine: Dispatching hourly status report for $101.00 account equity.
+2026-08-28 13:07:29,387 [INFO] TradingEngine: 🚀 [ATTEMPTING BUY] Strategy: MeanReversion | Asset: SOLUSDT | Qty: 0.1735 | Entry: $104.77 | TP: $106.02 | SL: $103.94
+2026-08-28 13:07:30,625 [INFO] TradingEngine: ✅ [BUY EXECUTED] Strategy: MeanReversion | Asset: SOLUSDT | Qty: 0.1735 | Entry: $104.77 | Order ID: 236768363081
+2026-08-28 13:07:48,309 [INFO] TradingEngine: [BUY] Strategy: MeanReversion | Asset: SOLUSDT | SKIPPED (Already holding LONG position)
+2026-08-28 13:08:05,217 [INFO] TradingEngine: [BUY] Strategy: MeanReversion | Asset: SOLUSDT | SKIPPED (Already holding LONG position)
+2026-08-28 13:08:22,484 [INFO] TradingEngine: 🚀 [ATTEMPTING BUY] Strategy: MeanReversion | Asset: BTCUSDT | Qty: 0.0002 | Entry: $78,988.90 | TP: $79,387.12 | SL: $78,723.42
+2026-08-28 13:08:23,202 [ERROR] TradingEngine: ❌ [BUY FAILED] Strategy: MeanReversion | Asset: BTCUSDT | Error: Calculated quantity 0.00023020699649950815 formatted to 0.000 (must be > 0)
+2026-08-28 13:08:23,467 [INFO] TradingEngine: [BUY] Strategy: MeanReversion | Asset: SOLUSDT | SKIPPED (Already holding LONG position)
+2026-08-28 13:09:30,936 [INFO] TradingEngine: 🚀 [ATTEMPTING BUY] Strategy: MeanReversion | Asset: BTCUSDT | Qty: 0.0002 | Entry: $78,989.90 | TP: $79,389.19 | SL: $78,723.70
+2026-08-28 13:09:30,937 [ERROR] TradingEngine: ❌ [BUY FAILED] Strategy: MeanReversion | Asset: BTCUSDT | Error: Calculated quantity 0.0002302357897959106 formatted to 0.000 (must be > 0)
+2026-08-28 13:09:31,200 [INFO] TradingEngine: [BUY] Strategy: MeanReversion | Asset: SOLUSDT | SKIPPED (Already holding LONG position)
+2026-08-28 13:09:48,587 [INFO] TradingEngine: 🚀 [ATTEMPTING BUY] Strategy: MeanReversion | Asset: BTCUSDT | Qty: 0.0002 | Entry: $79,012.10 | TP: $79,413.29 | SL: $78,744.64
+2026-08-28 13:09:48,587 [ERROR] TradingEngine: ❌ [BUY FAILED] Strategy: MeanReversion | Asset: BTCUSDT | Error: Calculated quantity 0.00023015359989925593 formatted to 0.000 (must be > 0)
+2026-08-28 13:09:48,849 [INFO] TradingEngine: [BUY] Strategy: MeanReversion | Asset: SOLUSDT | SKIPPED (Already holding LONG position)
+2026-08-28 13:10:07,340 [INFO] TradingEngine: 🚀 [ATTEMPTING BUY] Strategy: MeanReversion | Asset: BTCUSDT | Qty: 0.0002 | Entry: $79,004.40 | TP: $79,405.59 | SL: $78,736.94
+2026-08-28 13:10:07,340 [ERROR] TradingEngine: ❌ [BUY FAILED] Strategy: MeanReversion | Asset: BTCUSDT | Error: Calculated quantity 0.00023019040543311513 formatted to 0.000 (must be > 0)
+2026-08-28 13:18:10,694 [INFO] TradingEngine: Shutdown signal received.
+2026-08-28 13:18:10,695 [INFO] TradingEngine: Bot shutting down. Reason: Process Cancelled / Terminated
+2026-08-28 13:18:11,147 [INFO] TradingEngine: Engine offline.
+2026-08-28 13:18:27,448 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
+2026-08-28 13:18:29,600 [INFO] TradingEngine: Dispatching hourly status report for $101.10 account equity.
+2026-08-28 13:35:57,184 [INFO] TradingEngine: Shutdown signal received.
+2026-08-28 13:35:57,185 [INFO] TradingEngine: Bot shutting down. Reason: Process Cancelled / Terminated
+2026-08-28 13:35:57,666 [INFO] TradingEngine: Engine offline.
+2026-08-28 13:39:58,637 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
+2026-08-28 13:40:00,797 [INFO] TradingEngine: Dispatching hourly status report for $101.17 account equity.
+2026-08-28 13:48:48,834 [CRITICAL] TradingEngine: 24h Drawdown Breach! 🚨 24h Drawdown Limit Breached!
+• *Current Equity:* `$0.00`
+• *24h Peak Equity:* `$101.23`
+• *Drawdown:* `100.00%` (Threshold: `10.0%`)
+2026-08-28 13:48:48,837 [INFO] TradingEngine: Bot shutting down. Reason: 🚨 24h Drawdown Limit Breached!
+• *Current Equity:* `$0.00`
+• *24h Peak Equity:* `$101.23`
+• *Drawdown:* `100.00%` (Threshold: `10.0%`)
+2026-08-28 13:49:24,225 [INFO] TradingEngine: Engine offline.
+2026-08-28 13:52:45,950 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
+2026-08-28 13:53:34,249 [INFO] TradingEngine: Dispatching hourly status report for $101.26 account equity.
+2026-08-28 13:59:19,825 [WARNING] TradingEngine: Broker data fetch failed for BNBUSDT: . Generating fallback market snapshot...
+2026-08-28 14:00:06,828 [WARNING] TradingEngine: Broker data fetch failed for BTCUSDT: . Generating fallback market snapshot...
+2026-08-28 14:00:08,833 [ERROR] TradingEngine: Runtime error: Cannot join tz-naive with tz-aware DatetimeIndex
+2026-08-28 14:00:08,834 [INFO] TradingEngine: Bot shutting down. Reason: Runtime Error Exception: `Cannot join tz-naive with tz-aware DatetimeIndex`
+2026-08-28 14:00:12,237 [INFO] TradingEngine: Engine offline.
+2026-08-28 14:29:34,692 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
+2026-08-28 14:29:36,793 [INFO] TradingEngine: Dispatching hourly status report for $101.26 account equity.
+2026-08-28 15:19:21,024 [INFO] TradingEngine: Shutdown signal received.
+2026-08-28 15:19:21,025 [INFO] TradingEngine: Bot shutting down. Reason: Process Cancelled / Terminated
+2026-08-28 15:19:21,466 [INFO] TradingEngine: Engine offline.
+2026-08-28 15:29:13,037 [INFO] TradingEngine: Bot engine initialized. Dispatching start message to Telegram.
+2026-08-28 15:29:15,651 [INFO] TradingEngine: Dispatching hourly status report for $101.25 account equity.
+2026-08-28 15:29:50,387 [INFO] TradingEngine: Shutdown signal received.
+2026-08-28 15:29:50,389 [INFO] TradingEngine: Bot shutting down. Reason: Process Cancelled / Terminated
+2026-08-28 15:29:50,818 [INFO] TradingEngine: Engine offline.

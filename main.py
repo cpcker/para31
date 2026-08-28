@@ -1,13 +1,14 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import sys
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 
@@ -27,29 +28,30 @@ LOCAL_TZ = ZoneInfo("Europe/Athens")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-# Dual Logger Setup
+console = Console()
+
+# Synchronized Dual Logger Setup (RichHandler eliminates console line collisions)
 logger = logging.getLogger("TradingEngine")
 logger.setLevel(logging.INFO)
 
 if not logger.handlers:
     file_handler = logging.FileHandler("trading_bot.log", encoding="utf-8")
-    file_formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
+    file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(file_formatter)
-    logger.addHandler(stream_handler)
-
-console = Console()
+    rich_handler = RichHandler(
+        console=console,
+        show_time=False,
+        show_path=False,
+        markup=True
+    )
+    logger.addHandler(rich_handler)
 
 
 class AlgorithmicTradingEngine:
-    """Production Multi-Asset Trading Engine supporting Spot & 1x Futures
-    with position guardrails, leftover cash sweeping, single-fire attempt notifications,
-    and Telegram telemetry.
+    """Production Multi-Asset Trading Engine supporting Spot & Futures
+    with clean terminal output, position guardrails, and Telegram telemetry.
     """
 
     def __init__(self):
@@ -58,14 +60,14 @@ class AlgorithmicTradingEngine:
         self.risk_manager = RiskManager(self.config.risk)
         self.execution_engine = ExecutionEngine()
 
-        self.notifier: TelegramNotifier | None = None
+        self.notifier: Optional[TelegramNotifier] = None
         if self.config.telegram.is_enabled:
             self.notifier = TelegramNotifier(
                 bot_token=self.config.telegram.bot_token,
                 chat_id=self.config.telegram.chat_id,
             )
 
-        # FINE-TUNED STRATEGY PARAMETERS
+        # STRATEGY PARAMETERS
         self.trend_strategy = TrendFollowingEMA(
             fast_ema=9,
             slow_ema=21,
@@ -86,7 +88,7 @@ class AlgorithmicTradingEngine:
         self.last_hourly_report_time: float = 0.0
         self.stoppage_reason: str = "Normal Shutdown / Manual Stop"
 
-        # Track active attempt notifications to prevent phone spam on every tick
+        # Deduplication cache for single-fire Telegram attempt alerts
         self.attempted_signals: Dict[str, str] = {}
 
         if self.config.broker.broker_type == BrokerType.BINANCE:
@@ -117,7 +119,6 @@ class AlgorithmicTradingEngine:
                 curr_price = float(p.get("current_price", 0.0))
                 val = qty * curr_price
 
-                # Calculate TP/SL values for telemetry display
                 tp_str, sl_str = "N/A", "N/A"
                 df_s = df_dict.get(sym)
                 if df_s is not None and not df_s.empty and entry_price > 0:
@@ -187,6 +188,7 @@ class AlgorithmicTradingEngine:
             title="💼 Live Portfolio Telemetry",
             show_header=True,
             header_style="bold magenta",
+            expand=False,
         )
         port_table.add_column("Total Equity", justify="right", style="bold green")
         port_table.add_column("Free Cash / Margin", justify="right", style="green")
@@ -211,6 +213,7 @@ class AlgorithmicTradingEngine:
                 title=f"🔓 Open Portfolio Positions [{mkt_label}]",
                 show_header=True,
                 header_style="bold yellow",
+                expand=False,
             )
             pos_table.add_column("Symbol", style="cyan")
             pos_table.add_column("Quantity", justify="right")
@@ -238,6 +241,7 @@ class AlgorithmicTradingEngine:
             title=f"📊 Live Market Snapshot [{datetime.now(LOCAL_TZ).strftime('%H:%M:%S %Z')}]",
             show_header=True,
             header_style="bold cyan",
+            expand=False,
         )
         mkt_table.add_column("Symbol", style="bold yellow")
         mkt_table.add_column("Market Price", justify="right", style="bold green")
@@ -287,8 +291,11 @@ class AlgorithmicTradingEngine:
                 )
 
             periods = 100
+            # Timezone-naive index prevents pandas join errors
             dates = pd.date_range(
-                end=datetime.now(LOCAL_TZ), periods=periods, freq="15min"
+                end=datetime.now(timezone.utc).replace(tzinfo=None),
+                periods=periods,
+                freq="15min",
             )
             base_price = 150.0 if "USDC" not in symbol and "USDT" not in symbol else 30000.0
             np.random.seed(hash(symbol) % 2**32)
@@ -345,7 +352,7 @@ class AlgorithmicTradingEngine:
                         )
                         try:
                             await self.broker.place_order(sym, qty, close_side)
-                            self.attempted_signals.pop(sym, None)  # Reset signal cache
+                            self.attempted_signals.pop(sym, None)
                             await self.notify(
                                 f"🚨 *[SOFTWARE STOP LOSS EXECUTED]*\n"
                                 f"• *Asset:* `{sym}`\n"
@@ -384,34 +391,32 @@ class AlgorithmicTradingEngine:
         current_price = float(df["close"].iloc[-1])
         base_asset = symbol.replace("USDC", "").replace("USDT", "").replace("EUR", "")
         is_futures = self.config.broker.market_type == MarketType.FUTURES
+        leverage = getattr(self.config.broker, "futures_leverage", 1)
 
         positions = await self.broker.get_positions()
         held_pos = next((p for p in positions if p.get("symbol") in [symbol, base_asset]), None)
         held_qty = float(held_pos["qty"]) if held_pos else 0.0
         held_side = held_pos.get("side", "") if held_pos else ""
 
-        # DUAL-DIRECTION GUARDRAILS:
         if is_futures:
             if action == "BUY" and held_qty > 0 and held_side == "BUY":
-                logger.info(
-                    f"[{action}] Strategy: {strategy_name} | Asset: {symbol} | SKIPPED (Already holding LONG position)"
-                )
                 return
             if action == "SELL" and held_qty > 0 and held_side == "SELL":
-                logger.info(
-                    f"[{action}] Strategy: {strategy_name} | Asset: {symbol} | SKIPPED (Already holding SHORT position)"
-                )
                 return
         else:
             if action == "SELL" and held_qty <= 0:
-                logger.info(
-                    f"[{action}] Strategy: {strategy_name} | Asset: {symbol} | SKIPPED (No spot balance held)"
-                )
                 return
 
-        # Fetch live free cash for leftover sweeping calculation
         account_data = await self.broker.get_account_balance()
         available_cash = account_data.get("cash", 0.0)
+        margin_ratio = account_data.get("margin_ratio", 0.0)
+
+        # 1. MARGIN RATIO GUARDRAIL
+        if is_futures and margin_ratio >= 80.0:
+            logger.warning(
+                f"⚠️ [{symbol}] Trade blocked! High Margin Ratio: {margin_ratio:.1f}% (Safety Threshold: 80%)"
+            )
+            return
 
         atr = self.risk_manager.calculate_atr(df)
         units, sl_dist = self.risk_manager.calculate_atr_position_size(
@@ -428,19 +433,30 @@ class AlgorithmicTradingEngine:
             sl_price = current_price + sl_dist if sl_dist > 0 else current_price * 1.02
             tp_price = current_price - (sl_dist * 1.5) if sl_dist > 0 else current_price * 0.97
 
+        # 2. LIQUIDATION SAFETY GUARDRAIL
+        if is_futures and leverage > 1:
+            is_safe, est_liq, liq_msg = self.risk_manager.check_liquidation_safety(
+                entry_price=current_price,
+                stop_loss_price=sl_price,
+                side=action,
+                leverage=leverage,
+            )
+            if not is_safe:
+                logger.warning(
+                    f"🚨 [{symbol}] Trade REJECTED due to Liquidation Risk! Est Liq: ${est_liq:,.2f} | {liq_msg}"
+                )
+                return
+
         if units <= 0.0:
             return
 
         order_value = units * current_price
 
-        # SINGLE-FIRE ATTEMPT NOTIFICATION LOGIC
-        # Log to terminal/file on EVERY tick
         logger.info(
             f"🚀 [ATTEMPTING {action}] Strategy: {strategy_name} | Asset: {symbol} | "
             f"Qty: {units:.4f} | Entry: ${current_price:,.2f} | TP: ${tp_price:,.2f} | SL: ${sl_price:,.2f}"
         )
 
-        # Send to Telegram ONLY IF this specific action hasn't been notified yet for this symbol
         if self.attempted_signals.get(symbol) != action:
             self.attempted_signals[symbol] = action
             attempt_msg = (
@@ -448,6 +464,7 @@ class AlgorithmicTradingEngine:
                 f"• *Venue:* `{self.config.broker.broker_type.value} ({self.config.broker.market_type.value})`\n"
                 f"• *Strategy:* `{strategy_name}`\n"
                 f"• *Asset:* `{symbol}`\n"
+                f"• *Leverage:* `{leverage}x`\n"
                 f"• *Quantity:* `{units:.4f}`\n"
                 f"• *Entry Price:* `${current_price:,.2f}`\n"
                 f"• *Take Profit:* `${tp_price:,.2f}`\n"
@@ -473,8 +490,6 @@ class AlgorithmicTradingEngine:
                 tp=tp_price,
             )
             self.risk_manager.record_execution(symbol, order_value)
-
-            # Clear attempt record on successful entry
             self.attempted_signals.pop(symbol, None)
 
             exec_log = (
@@ -487,6 +502,7 @@ class AlgorithmicTradingEngine:
                 f"✅ *[{action} EXECUTED]*\n"
                 f"• *Asset:* `{symbol}`\n"
                 f"• *Side:* `{action}`\n"
+                f"• *Leverage:* `{leverage}x`\n"
                 f"• *Quantity:* `{units:.4f}`\n"
                 f"• *Entry Price:* `${current_price:,.2f}`\n"
                 f"• *Take Profit:* `${tp_price:,.2f}`\n"
@@ -583,33 +599,41 @@ class AlgorithmicTradingEngine:
             while self.is_running:
                 console.clear()
 
+                # 1. Fetch Account Data safely with Error Resilience
                 try:
                     account_data = await self.broker.get_account_balance()
                     positions = await self.broker.get_positions()
+                    api_fetch_success = True
                 except Exception as err:
                     logger.warning(f"Failed to fetch portfolio update: {err}")
-                    account_data = {"equity": self.config.allocated_capital, "cash": 0.0, "buying_power": 0.0}
+                    account_data = {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
                     positions = []
+                    api_fetch_success = False
 
-                current_equity = account_data.get("equity", self.config.allocated_capital)
+                current_equity = account_data.get("equity", 0.0)
 
-                if self.risk_manager.check_24h_drawdown_kill_switch(current_equity):
-                    peak = self.risk_manager.peak_equity
-                    dd_pct = ((peak - current_equity) / peak) if peak > 0 else 0.0
-                    self.stoppage_reason = (
-                        f"🚨 24h Drawdown Limit Breached!\n"
-                        f"• *Current Equity:* `${current_equity:,.2f}`\n"
-                        f"• *24h Peak Equity:* `${peak:,.2f}`\n"
-                        f"• *Drawdown:* `{dd_pct:.2%}` (Threshold: `{self.config.risk.max_drawdown_pct:.1%}`)"
-                    )
-                    logger.critical(f"24h Drawdown Breach! {self.stoppage_reason}")
-                    break
+                # 2. DRAWDOWN GUARDRAIL: Check drawdown ONLY IF the API returned valid > 0 equity
+                if api_fetch_success and current_equity > 0.0:
+                    if self.risk_manager.check_24h_drawdown_kill_switch(current_equity):
+                        peak = self.risk_manager.peak_equity
+                        dd_pct = ((peak - current_equity) / peak) if peak > 0 else 0.0
+                        self.stoppage_reason = (
+                            f"🚨 24h Drawdown Limit Breached!\n"
+                            f"• *Current Equity:* `${current_equity:,.2f}`\n"
+                            f"• *24h Peak Equity:* `${peak:,.2f}`\n"
+                            f"• *Drawdown:* `{dd_pct:.2%}` (Threshold: `{self.config.risk.max_drawdown_pct:.1%}`)"
+                        )
+                        logger.critical(f"24h Drawdown Breach! {self.stoppage_reason}")
+                        break
+                elif not api_fetch_success:
+                    logger.warning("⚠️ Skipping Drawdown & Trade Execution checks due to temporary API fetch failure.")
+                    await asyncio.sleep(loop_interval_seconds)
+                    continue
 
                 df_dict = await self.fetch_market_data()
 
                 self.display_portfolio_and_market_tables(df_dict, account_data, positions)
 
-                # Software-level risk backup check
                 await self.process_software_stop_loss_guardrail(positions, df_dict, current_equity)
 
                 now_ts = asyncio.get_event_loop().time()

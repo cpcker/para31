@@ -99,74 +99,19 @@ class AlpacaBroker(BaseBroker):
         }
 
     async def get_positions(self) -> List[Dict[str, Any]]:
-        if not self.client:
-            return []
-
-        if self.is_futures:
-            try:
-                pos_info = await self.client.futures_position_information()
-                positions = []
-                for pos in pos_info:
-                    amt = float(pos["positionAmt"])
-                    mark_price = float(pos["markPrice"])
-                    
-                    # 🧹 DUST FILTER: Ignore micro-positions worth less than $2.00 USDT
-                    if amt != 0 and (abs(amt) * mark_price) > 2.0:
-                        positions.append({
-                            "symbol": pos["symbol"],
-                            "qty": abs(amt),
-                            "side": "BUY" if amt > 0 else "SELL",
-                            "entry_price": float(pos["entryPrice"]),
-                            "current_price": mark_price,
-                            "unrealized_pnl": float(pos["unRealizedProfit"]),
-                        })
-                return positions
-            except Exception as e:
-                logger.error(f"Error fetching futures positions: {e}")
-                return []
-        else:
-            acc = await self.client.get_account()
-            price_map = await self._get_all_asset_prices()
-
-            positions = []
-            for b in acc["balances"]:
-                asset = b["asset"]
-                free = float(b["free"])
-                locked = float(b["locked"])
-                total = free + locked
-
-                if total > 0:
-                    pair_usdc = f"{asset}USDC"
-                    pair_usdt = f"{asset}USDT"
-                    pair_eur = f"{asset}EUR"
-
-                    if asset in ["USDC", "USDT"]:
-                        curr_price = 1.0
-                    elif asset == "EUR":
-                        curr_price = price_map.get("EURUSDT", 1.08)
-                    elif pair_usdc in price_map:
-                        curr_price = price_map[pair_usdc]
-                    elif pair_usdt in price_map:
-                        curr_price = price_map[pair_usdt]
-                    elif pair_eur in price_map:
-                        curr_price = price_map[pair_eur]
-                    else:
-                        curr_price = 0.0
-
-                    # 🧹 DUST FILTER: Ignore spot wallets worth less than $2.00 USDT
-                    if (total * curr_price) > 2.0:
-                        positions.append(
-                            {
-                                "symbol": asset,
-                                "qty": total,
-                                "side": "HOLD",
-                                "entry_price": curr_price,
-                                "current_price": curr_price,
-                                "unrealized_pnl": 0.0,
-                            }
-                        )
-
-            return positions
+        positions = await asyncio.to_thread(self.trading_client.get_all_positions)
+        return [
+            {
+                "symbol": pos.symbol,
+                "qty": float(pos.qty),
+                "side": pos.side.value.upper(),
+                "entry_price": float(pos.avg_entry_price),
+                "current_price": float(pos.current_price),
+                "unrealized_pnl": float(pos.unrealized_pl),
+                "market_value": float(pos.market_value),
+            }
+            for pos in positions
+        ]
 
     async def get_historical_klines(
         self, symbol: str, timeframe: str = "15m", limit: int = 100
@@ -310,7 +255,7 @@ class BinanceBroker(BaseBroker):
                     await self.client.futures_change_leverage(symbol=sym, leverage=self.leverage)
                     await self.client.futures_change_margin_type(symbol=sym, marginType="CROSSED")
                 except Exception as e:
-                    if "-4046" in str(e) or "No need to change margin type" in str(e):
+                    if "-4046" in str(e) or "-4067" in str(e) or "No need to change margin type" in str(e):
                         pass
                     else:
                         logger.warning(f"Could not initialize futures leverage for {sym}: {e}")
@@ -329,21 +274,27 @@ class BinanceBroker(BaseBroker):
 
     async def get_account_balance(self) -> Dict[str, float]:
         if not self.client:
-            return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
+            return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "margin_ratio": 0.0}
 
         if self.is_futures:
             try:
                 acc = await self.client.futures_account()
                 total_margin = float(acc.get("totalMarginBalance", 0.0))
                 available_balance = float(acc.get("availableBalance", 0.0))
+                maint_margin = float(acc.get("totalMaintMargin", 0.0))
+
+                margin_ratio = (maint_margin / total_margin * 100.0) if total_margin > 0 else 0.0
+
                 return {
                     "equity": total_margin,
                     "cash": available_balance,
                     "buying_power": available_balance * self.leverage,
+                    "margin_ratio": margin_ratio,
+                    "maint_margin": maint_margin,
                 }
             except Exception as e:
                 logger.error(f"Error fetching futures account balance: {e}")
-                return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0}
+                return {"equity": 0.0, "cash": 0.0, "buying_power": 0.0, "margin_ratio": 0.0}
         else:
             acc = await self.client.get_account()
             price_map = await self._get_all_asset_prices()
@@ -388,6 +339,7 @@ class BinanceBroker(BaseBroker):
                 "equity": total_equity,
                 "cash": free_fiat_stable,
                 "buying_power": free_fiat_stable,
+                "margin_ratio": 0.0,
             }
 
     async def get_positions(self) -> List[Dict[str, Any]]:
@@ -400,13 +352,16 @@ class BinanceBroker(BaseBroker):
                 positions = []
                 for pos in pos_info:
                     amt = float(pos["positionAmt"])
-                    if amt != 0:
+                    mark_price = float(pos["markPrice"])
+
+                    # Dust Filter: Ignore micro-positions worth less than $2.00 USDT
+                    if amt != 0 and (abs(amt) * mark_price) > 2.0:
                         positions.append({
                             "symbol": pos["symbol"],
                             "qty": abs(amt),
                             "side": "BUY" if amt > 0 else "SELL",
                             "entry_price": float(pos["entryPrice"]),
-                            "current_price": float(pos["markPrice"]),
+                            "current_price": mark_price,
                             "unrealized_pnl": float(pos["unRealizedProfit"]),
                         })
                 return positions
@@ -442,16 +397,17 @@ class BinanceBroker(BaseBroker):
                     else:
                         curr_price = 0.0
 
-                    positions.append(
-                        {
-                            "symbol": asset,
-                            "qty": total,
-                            "side": "HOLD",
-                            "entry_price": curr_price,
-                            "current_price": curr_price,
-                            "unrealized_pnl": 0.0,
-                        }
-                    )
+                    if (total * curr_price) > 2.0:
+                        positions.append(
+                            {
+                                "symbol": asset,
+                                "qty": total,
+                                "side": "HOLD",
+                                "entry_price": curr_price,
+                                "current_price": curr_price,
+                                "unrealized_pnl": 0.0,
+                            }
+                        )
 
             return positions
 
@@ -506,23 +462,27 @@ class BinanceBroker(BaseBroker):
 
         norm = self.normalize_symbol(symbol)
 
-        # Quantity precision formatting per Binance symbol specifications
+        # Precision handling per symbol step size rules
         if "BTC" in norm:
-            formatted_qty = f"{qty:.3f}"
+            clean_qty = round(qty, 5)
+            formatted_qty = f"{clean_qty:.5f}".rstrip("0").rstrip(".")
         elif "ETH" in norm:
-            formatted_qty = f"{qty:.3f}"
+            clean_qty = round(qty, 4)
+            formatted_qty = f"{clean_qty:.4f}".rstrip("0").rstrip(".")
         else:
-            formatted_qty = f"{qty:.2f}"
+            clean_qty = round(qty, 2)
+            formatted_qty = f"{clean_qty:.2f}"
 
-        # Safety check: ensure formatted quantity is non-zero
-        if float(formatted_qty) <= 0:
-            raise ValueError(f"Calculated quantity {qty} formatted to {formatted_qty} (must be > 0)")
+        if float(formatted_qty or 0) <= 0:
+            logger.warning(
+                f"Skipping {norm}: Calculated quantity {qty} formatted to '{formatted_qty}' (must be > 0)"
+            )
+            return {"order_id": "SKIPPED", "status": "REJECTED"}
 
         order_side = side.upper()
         exit_side = "SELL" if order_side == "BUY" else "BUY"
 
         if self.is_futures:
-            # 1. Primary Market Entry Order
             res = await self.client.futures_create_order(
                 symbol=norm,
                 side=order_side,
@@ -533,7 +493,6 @@ class BinanceBroker(BaseBroker):
 
             price_precision = 2
 
-            # 2. Attach Stop Loss Order
             if sl and sl > 0:
                 try:
                     sl_str = f"{round(sl, price_precision):.{price_precision}f}"
@@ -549,7 +508,6 @@ class BinanceBroker(BaseBroker):
                 except Exception as sl_err:
                     logger.error(f"❌ Failed to set native Futures Stop Loss for {norm}: {sl_err}")
 
-            # 3. Attach Take Profit Order
             if tp and tp > 0:
                 try:
                     tp_str = f"{round(tp, price_precision):.{price_precision}f}"

@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 class RiskManager:
-    """Production Risk Management Module handling position sizing, daily turnover caps,
-    leftover cash sweeping, margin buffers, and 24-hour peak equity drawdown tracking.
+    """Production Risk Management Module handling position sizing, liquidation safeguards,
+    daily turnover caps, margin buffers, and 24-hour peak equity drawdown tracking.
     """
 
     def __init__(self, config: RiskConfig):
@@ -51,26 +51,51 @@ class RiskManager:
         risk_per_trade_pct = getattr(self.config, "risk_per_trade_pct", 0.02)
         risk_amount = capital * risk_per_trade_pct
 
-        # Initial risk-based position calculation
         target_notional = (risk_amount / sl_distance) * current_price
 
-        # 1. HARD CAP: Never allow a single trade to exceed 18% of total account equity
+        # Hard Cap: Never allow a single trade to exceed 18% of total account equity
         max_allowed_notional = capital * 0.18
         if target_notional > max_allowed_notional:
             target_notional = max_allowed_notional
 
-        # 2. MARGIN BUFFER: Leave 15% free cash room for Binance SL margin reservation & fees
+        # Cash Buffer: Leave 15% free cash room for Binance SL margin reservation & fees
         if available_cash is not None and available_cash > 0:
             sweepable_cash = available_cash * 0.85
             if target_notional > sweepable_cash:
                 target_notional = sweepable_cash
 
-        # 3. MINIMUM NOTIONAL GUARDRAIL: Require at least $10.00 USDT per position
+        # Minimum Notional Guardrail: Require at least $10.00 USDT per position
         if target_notional < 10.0:
             return 0.0, sl_distance
 
         units = target_notional / current_price
         return units, sl_distance
+
+    def check_liquidation_safety(
+        self,
+        entry_price: float,
+        stop_loss_price: float,
+        side: str,
+        leverage: int = 2,
+    ) -> Tuple[bool, float, str]:
+        """Calculates estimated liquidation price and ensures Stop Loss is safely placed ahead of it."""
+        if leverage <= 1:
+            return True, 0.0, "Spot Mode / 1x Leverage - No Liquidation Risk"
+
+        maintenance_margin_rate = 0.004  # ~0.4% Tier 1 MMR for major pairs
+
+        if side.upper() == "BUY":
+            est_liquidation = entry_price * (1.0 - (1.0 / leverage) + maintenance_margin_rate)
+            buffer_price = est_liquidation * 1.015  # 1.5% safety cushion above liquidation
+            is_safe = stop_loss_price > buffer_price
+            msg = f"SL (${stop_loss_price:,.2f}) > Liq Cushion (${buffer_price:,.2f})"
+        else:
+            est_liquidation = entry_price * (1.0 + (1.0 / leverage) - maintenance_margin_rate)
+            buffer_price = est_liquidation * 0.985  # 1.5% safety cushion below liquidation
+            is_safe = stop_loss_price < buffer_price
+            msg = f"SL (${stop_loss_price:,.2f}) < Liq Cushion (${buffer_price:,.2f})"
+
+        return is_safe, est_liquidation, msg
 
     def validate_trade(
         self, symbol: str, trade_notional_value: float, current_equity: float
