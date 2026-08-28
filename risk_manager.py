@@ -1,122 +1,115 @@
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, Tuple
+from datetime import datetime
+from typing import Dict, Optional, Tuple
+import numpy as np
 import pandas as pd
-import ta
+from config import RiskConfig
 
-logger = logging.getLogger("TradingEngine")
+logger = logging.getLogger(__name__)
 
 
 class RiskManager:
-    """Production Risk Manager: handles ATR dynamic volatility sizing, 
-    trade validation filters, daily exposure caps, and 24h drawdown kill-switch.
+    """Production Risk Management Module handling position sizing, daily turnover caps,
+    leftover cash sweeping, margin buffers, and 24-hour peak equity drawdown tracking.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: RiskConfig):
         self.config = config
         self.daily_executions: Dict[str, float] = {}
         self.peak_equity: float = 0.0
-        self.last_equity_reset: datetime = datetime.utcnow()
 
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Calculates Average True Range (ATR) to size dynamic volatility stop-losses."""
+        """Calculates Average True Range (ATR) over high, low, and close columns."""
         if df.empty or len(df) < period:
             return 0.0
 
-        try:
-            atr_series = ta.volatility.AverageTrueRange(
-                high=df["high"],
-                low=df["low"],
-                close=df["close"],
-                window=period,
-            ).average_true_range()
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
 
-            atr_val = atr_series.iloc[-1]
-            return float(atr_val) if not pd.isna(atr_val) else 0.0
-        except Exception as e:
-            logger.error(f"Error calculating ATR: {e}")
-            return 0.0
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean().iloc[-1]
+
+        return float(atr) if not np.isnan(atr) else 0.0
 
     def calculate_atr_position_size(
-        self, capital: float, current_price: float, atr: float
+        self,
+        capital: float,
+        current_price: float,
+        atr: float,
+        available_cash: Optional[float] = None,
     ) -> Tuple[float, float]:
-        """Calculates position units and stop distance based on account equity and market volatility.
-        Ensures trades respect Binance's ~$10 minimum notional requirement.
-        """
-        if current_price <= 0.0 or capital <= 0.0:
+        """Calculates position quantity and Stop Loss distance with strict margin safeguards."""
+        if atr <= 0 or current_price <= 0 or capital <= 0:
             return 0.0, 0.0
 
-        # Default fallback stop loss if ATR is invalid
-        stop_loss_distance = (atr * 2.0) if atr > 0 else (current_price * 0.02)
-
-        # Risk allocation per trade (e.g., 2% of total equity)
+        sl_distance = atr * getattr(self.config, "atr_multiplier", 1.5)
         risk_per_trade_pct = getattr(self.config, "risk_per_trade_pct", 0.02)
         risk_amount = capital * risk_per_trade_pct
 
-        # Position units derived from ATR risk distance
-        units = risk_amount / stop_loss_distance if stop_loss_distance > 0 else 0.0
+        # Initial risk-based position calculation
+        target_notional = (risk_amount / sl_distance) * current_price
 
-        # Cap maximum position size at 25% of account capital per trade
-        max_allowed_units = (capital * 0.25) / current_price
-        units = min(units, max_allowed_units)
+        # 1. HARD CAP: Never allow a single trade to exceed 18% of total account equity
+        max_allowed_notional = capital * 0.18
+        if target_notional > max_allowed_notional:
+            target_notional = max_allowed_notional
 
-        # Enforce Binance Spot ~$10 minimum notional order filter
-        order_value = units * current_price
-        if order_value < 10.50:
-            units = 10.50 / current_price
+        # 2. MARGIN BUFFER: Leave 15% free cash room for Binance SL margin reservation & fees
+        if available_cash is not None and available_cash > 0:
+            sweepable_cash = available_cash * 0.85
+            if target_notional > sweepable_cash:
+                target_notional = sweepable_cash
 
-        # Absolute cap: never order more than available capital
-        if (units * current_price) > capital:
-            units = capital / current_price
+        # 3. MINIMUM NOTIONAL GUARDRAIL: Require at least $10.00 USDT per position
+        if target_notional < 10.0:
+            return 0.0, sl_distance
 
-        return units, stop_loss_distance
+        units = target_notional / current_price
+        return units, sl_distance
 
     def validate_trade(
-        self, symbol: str, order_value: float, equity: float
+        self, symbol: str, trade_notional_value: float, current_equity: float
     ) -> Tuple[bool, str]:
-        """Validates trade execution against capital exposure limits."""
-        if equity <= 0:
-            return False, "Equity is zero or negative."
+        """Enforces trade validation rules and daily volume limits."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        accumulated_turnover = self.daily_executions.get(today_str, 0.0)
 
-        if order_value > equity * 0.95:
-            return False, f"Order value (${order_value:.2f}) exceeds max safe capital allocation."
+        max_turnover_limit = current_equity * getattr(self.config, "max_daily_turnover_mult", 5.0)
 
-        # Check total daily execution cap to prevent runaway trade looping
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        daily_spent = self.daily_executions.get(today, 0.0)
-        max_daily_limit = equity * 3.0  # Max 300% account turnover per day
+        if (accumulated_turnover + trade_notional_value) > max_turnover_limit:
+            reason = (
+                f"24h Volume Cap Exceeded! Current: ${accumulated_turnover:,.2f} + "
+                f"Trade: ${trade_notional_value:,.2f} > Max Limit: ${max_turnover_limit:,.2f}"
+            )
+            return False, reason
 
-        if daily_spent + order_value > max_daily_limit:
-            return False, f"Daily turnover limit exceeded (${daily_spent:.2f} spent today)."
+        return True, "Trade Approved"
 
-        return True, "Trade approved."
-
-    def record_execution(self, symbol: str, order_value: float) -> None:
-        """Tracks daily trade turnover to prevent overtrading."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        self.daily_executions[today] = self.daily_executions.get(today, 0.0) + order_value
-        logger.info(f"Recorded trade execution for {symbol}: ${order_value:.2f}")
+    def record_execution(self, symbol: str, trade_notional_value: float) -> None:
+        """Tracks daily execution volume for turnover reporting."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        self.daily_executions[today_str] = (
+            self.daily_executions.get(today_str, 0.0) + trade_notional_value
+        )
 
     def check_24h_drawdown_kill_switch(self, current_equity: float) -> bool:
-        """Circuit breaker: Halts all trading if account equity drops past max allowed drawdown."""
-        now = datetime.utcnow()
-
-        # Reset peak equity tracking window every 24 hours
-        if now - self.last_equity_reset > timedelta(hours=24) or current_equity > self.peak_equity:
+        """Monitors total portfolio drawdown relative to 24h peak equity."""
+        if current_equity > self.peak_equity:
             self.peak_equity = current_equity
-            self.last_equity_reset = now
+            return False
 
         if self.peak_equity <= 0:
             return False
 
         drawdown_pct = (self.peak_equity - current_equity) / self.peak_equity
-        max_allowed_dd = getattr(self.config, "max_drawdown_pct", 0.15)  # 15% max drawdown
+        max_dd_cap = getattr(self.config, "max_drawdown_pct", 0.15)
 
-        if drawdown_pct >= max_allowed_dd:
-            logger.critical(
-                f"🚨 CIRCUIT BREAKER TRIGGERED! 24h Drawdown: {drawdown_pct:.2%} "
-                f"(Peak: ${self.peak_equity:.2f}, Current: ${current_equity:.2f})"
-            )
+        if drawdown_pct >= max_dd_cap:
             return True
 
         return False

@@ -3,7 +3,7 @@ from datetime import datetime
 import logging
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -23,11 +23,11 @@ from telegram_notifier import TelegramNotifier
 # Local timezone (EEST / UTC+3)
 LOCAL_TZ = ZoneInfo("Europe/Athens")
 
-# Force UTF-8 encoding on standard output for Windows terminal emoji rendering
+# Force UTF-8 encoding on standard output for terminal emoji rendering
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-# Dual Logger Setup (UTF-8 Encoded Disk File + Terminal Stream)
+# Dual Logger Setup
 logger = logging.getLogger("TradingEngine")
 logger.setLevel(logging.INFO)
 
@@ -48,7 +48,8 @@ console = Console()
 
 class AlgorithmicTradingEngine:
     """Production Multi-Asset Trading Engine supporting Spot & 1x Futures
-    with position guardrails, fine-tuned parameters, and Telegram telemetry.
+    with position guardrails, leftover cash sweeping, single-fire attempt notifications,
+    and Telegram telemetry.
     """
 
     def __init__(self):
@@ -66,24 +67,27 @@ class AlgorithmicTradingEngine:
 
         # FINE-TUNED STRATEGY PARAMETERS
         self.trend_strategy = TrendFollowingEMA(
-            fast_ema=9,           # Faster sensitivity for 15m timeframes
+            fast_ema=9,
             slow_ema=21,
-            adx_threshold=30.0    # Strict trend filter to eliminate sideways false signals
+            adx_threshold=30.0
         )
         self.mean_reversion_strategy = MeanReversionBB(
             bb_window=20,
-            bb_std=2.5,           # Increased standard deviation threshold to filter out noise
+            bb_std=2.5,
             rsi_period=14
         )
         self.pair_strategy = PairTradingStatArb(
-            entry_z=2.5,          # Stricter spread entry threshold for extreme mean reversion
-            exit_z=0.1,           # Mean reversion exit target closer to equilibrium
-            p_val_threshold=0.01  # Require 99% confidence for pair cointegration
+            entry_z=2.5,
+            exit_z=0.1,
+            p_val_threshold=0.01
         )
 
         self.is_running = False
         self.last_hourly_report_time: float = 0.0
         self.stoppage_reason: str = "Normal Shutdown / Manual Stop"
+
+        # Track active attempt notifications to prevent phone spam on every tick
+        self.attempted_signals: Dict[str, str] = {}
 
         if self.config.broker.broker_type == BrokerType.BINANCE:
             self.monitored_symbols: List[str] = self.config.broker.trading_pairs
@@ -95,9 +99,9 @@ class AlgorithmicTradingEngine:
             await self.notifier.send_message(message)
 
     async def send_hourly_portfolio_report(
-        self, account_data: Dict[str, float], positions: List[Dict]
+        self, account_data: Dict[str, float], positions: List[Dict], df_dict: Dict[str, pd.DataFrame]
     ) -> None:
-        """Sends an automated status report to Telegram every 60 minutes."""
+        """Sends an automated status report to Telegram every 60 minutes with TP/SL levels."""
         now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
         equity = account_data.get("equity", 0.0)
         cash = account_data.get("cash", 0.0)
@@ -109,11 +113,38 @@ class AlgorithmicTradingEngine:
                 sym = p.get("symbol", "N/A")
                 qty = float(p.get("qty", 0.0))
                 side = p.get("side", "HOLD")
-                price = float(p.get("current_price", 0.0))
-                val = qty * price
-                holdings_summary += f"  • `{sym}` ({side}): `{qty:.4f}` (~${val:,.2f})\n"
+                entry_price = float(p.get("entry_price", 0.0))
+                curr_price = float(p.get("current_price", 0.0))
+                val = qty * curr_price
+
+                # Calculate TP/SL values for telemetry display
+                tp_str, sl_str = "N/A", "N/A"
+                df_s = df_dict.get(sym)
+                if df_s is not None and not df_s.empty and entry_price > 0:
+                    atr = self.risk_manager.calculate_atr(df_s)
+                    _, sl_dist = self.risk_manager.calculate_atr_position_size(
+                        capital=equity, current_price=entry_price, atr=atr
+                    )
+                    sl_dist = sl_dist if sl_dist > 0 else entry_price * 0.02
+
+                    if side == "BUY":
+                        sl_val = entry_price - sl_dist
+                        tp_val = entry_price + (sl_dist * 1.5)
+                    else:
+                        sl_val = entry_price + sl_dist
+                        tp_val = entry_price - (sl_dist * 1.5)
+                    
+                    tp_str = f"${tp_val:,.2f}"
+                    sl_str = f"${sl_val:,.2f}"
+
+                holdings_summary += (
+                    f"  • *{sym}* ({side})\n"
+                    f"    Qty: `{qty:.4f}` (~${val:,.2f})\n"
+                    f"    Entry: `${entry_price:,.2f}` | Mark: `${curr_price:,.2f}`\n"
+                    f"    🎯 TP: `{tp_str}` | 🛡️ SL: `{sl_str}`\n\n"
+                )
         else:
-            holdings_summary = "  • _No active positions held (100% Cash/Margin)_\n"
+            holdings_summary = "  • _No active positions held (100% Cash/Margin)_\n\n"
 
         today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
         daily_turnover = self.risk_manager.daily_executions.get(today_str, 0.0)
@@ -124,7 +155,7 @@ class AlgorithmicTradingEngine:
             f"💰 *Total Account Equity:* `${equity:,.2f}`\n"
             f"💵 *Available Free Cash:* `${cash:,.2f}`\n"
             f"📊 *24h Volume Turnover:* `${daily_turnover:,.2f}`\n\n"
-            f"📦 *Active Wallet Positions:*\n{holdings_summary}\n"
+            f"📦 *Active Wallet Positions:*\n{holdings_summary}"
             f"🟢 *Status:* Running normally on `{self.config.broker.broker_type.value}` ({mkt_label})."
         )
 
@@ -281,6 +312,50 @@ class AlgorithmicTradingEngine:
 
         return data
 
+    async def process_software_stop_loss_guardrail(
+        self, positions: List[Dict], df_dict: Dict[str, pd.DataFrame], current_equity: float
+    ) -> None:
+        """Backup safeguard: Market closes any position that breaches ATR Stop Loss limits."""
+        for pos in positions:
+            sym = pos.get("symbol")
+            side = pos.get("side")
+            curr_p = float(pos.get("current_price", 0.0))
+            entry_p = float(pos.get("entry_price", 0.0))
+            qty = float(pos.get("qty", 0.0))
+
+            if qty > 0 and entry_p > 0 and curr_p > 0:
+                df_s = df_dict.get(sym)
+                if df_s is not None and not df_s.empty:
+                    atr = self.risk_manager.calculate_atr(df_s)
+                    _, sl_dist = self.risk_manager.calculate_atr_position_size(
+                        capital=current_equity, current_price=entry_p, atr=atr
+                    )
+                    sl_dist = sl_dist if sl_dist > 0 else entry_p * 0.02
+
+                    stop_triggered = False
+                    if side == "BUY" and curr_p <= (entry_p - sl_dist):
+                        stop_triggered = True
+                    elif side == "SELL" and curr_p >= (entry_p + sl_dist):
+                        stop_triggered = True
+
+                    if stop_triggered:
+                        close_side = "SELL" if side == "BUY" else "BUY"
+                        logger.warning(
+                            f"🚨 [SOFTWARE STOP LOSS TRIGGERED] {sym} @ ${curr_p:,.2f}! Market closing position..."
+                        )
+                        try:
+                            await self.broker.place_order(sym, qty, close_side)
+                            self.attempted_signals.pop(sym, None)  # Reset signal cache
+                            await self.notify(
+                                f"🚨 *[SOFTWARE STOP LOSS EXECUTED]*\n"
+                                f"• *Asset:* `{sym}`\n"
+                                f"• *Side:* `{side}`\n"
+                                f"• *Entry:* `${entry_p:,.2f}`\n"
+                                f"• *Exit:* `${curr_p:,.2f}`"
+                            )
+                        except Exception as close_err:
+                            logger.error(f"Failed software stop loss close for {sym}: {close_err}")
+
     async def process_trend_and_mean_reversion(
         self, df_dict: Dict[str, pd.DataFrame], current_equity: float
     ) -> None:
@@ -315,7 +390,7 @@ class AlgorithmicTradingEngine:
         held_qty = float(held_pos["qty"]) if held_pos else 0.0
         held_side = held_pos.get("side", "") if held_pos else ""
 
-        # DUAL-DIRECTION POSITION GUARDRAILS:
+        # DUAL-DIRECTION GUARDRAILS:
         if is_futures:
             if action == "BUY" and held_qty > 0 and held_side == "BUY":
                 logger.info(
@@ -334,9 +409,16 @@ class AlgorithmicTradingEngine:
                 )
                 return
 
+        # Fetch live free cash for leftover sweeping calculation
+        account_data = await self.broker.get_account_balance()
+        available_cash = account_data.get("cash", 0.0)
+
         atr = self.risk_manager.calculate_atr(df)
         units, sl_dist = self.risk_manager.calculate_atr_position_size(
-            capital=current_equity, current_price=current_price, atr=atr
+            capital=current_equity,
+            current_price=current_price,
+            atr=atr,
+            available_cash=available_cash,
         )
 
         if action == "BUY":
@@ -351,30 +433,34 @@ class AlgorithmicTradingEngine:
 
         order_value = units * current_price
 
-        attempt_msg = (
-            f"🚀 *[ATTEMPTING {action}]*\n"
-            f"• *Venue:* `{self.config.broker.broker_type.value} ({self.config.broker.market_type.value})`\n"
-            f"• *Strategy:* `{strategy_name}`\n"
-            f"• *Asset:* `{symbol}`\n"
-            f"• *Quantity:* `{units:.4f}`\n"
-            f"• *Entry Price:* `${current_price:,.2f}`\n"
-            f"• *Take Profit:* `${tp_price:,.2f}`\n"
-            f"• *Stop Loss:* `${sl_price:,.2f}`"
-        )
+        # SINGLE-FIRE ATTEMPT NOTIFICATION LOGIC
+        # Log to terminal/file on EVERY tick
         logger.info(
             f"🚀 [ATTEMPTING {action}] Strategy: {strategy_name} | Asset: {symbol} | "
             f"Qty: {units:.4f} | Entry: ${current_price:,.2f} | TP: ${tp_price:,.2f} | SL: ${sl_price:,.2f}"
         )
-        await self.notify(attempt_msg)
+
+        # Send to Telegram ONLY IF this specific action hasn't been notified yet for this symbol
+        if self.attempted_signals.get(symbol) != action:
+            self.attempted_signals[symbol] = action
+            attempt_msg = (
+                f"🚀 *[ATTEMPTING {action}]*\n"
+                f"• *Venue:* `{self.config.broker.broker_type.value} ({self.config.broker.market_type.value})`\n"
+                f"• *Strategy:* `{strategy_name}`\n"
+                f"• *Asset:* `{symbol}`\n"
+                f"• *Quantity:* `{units:.4f}`\n"
+                f"• *Entry Price:* `${current_price:,.2f}`\n"
+                f"• *Take Profit:* `${tp_price:,.2f}`\n"
+                f"• *Stop Loss:* `${sl_price:,.2f}`"
+            )
+            await self.notify(attempt_msg)
 
         allowed, reason = self.risk_manager.validate_trade(
             symbol, order_value, current_equity
         )
 
         if not allowed:
-            reject_msg = f"⚠️ *[{strategy_name}] Trade Rejected*\n• *Reason:* {reason}"
             logger.warning(f"[{strategy_name}] Trade rejected for {symbol}: {reason}")
-            await self.notify(reject_msg)
             return
 
         try:
@@ -388,6 +474,9 @@ class AlgorithmicTradingEngine:
             )
             self.risk_manager.record_execution(symbol, order_value)
 
+            # Clear attempt record on successful entry
+            self.attempted_signals.pop(symbol, None)
+
             exec_log = (
                 f"✅ [{action} EXECUTED] Strategy: {strategy_name} | Asset: {symbol} | "
                 f"Qty: {units:.4f} | Entry: ${current_price:,.2f} | Order ID: {order_res.get('order_id', 'N/A')}"
@@ -397,14 +486,17 @@ class AlgorithmicTradingEngine:
             success_msg = (
                 f"✅ *[{action} EXECUTED]*\n"
                 f"• *Asset:* `{symbol}`\n"
+                f"• *Side:* `{action}`\n"
+                f"• *Quantity:* `{units:.4f}`\n"
+                f"• *Entry Price:* `${current_price:,.2f}`\n"
+                f"• *Take Profit:* `${tp_price:,.2f}`\n"
+                f"• *Stop Loss:* `${sl_price:,.2f}`\n"
                 f"• *Order ID:* `{order_res.get('order_id', 'N/A')}`"
             )
             await self.notify(success_msg)
 
         except Exception as e:
-            fail_msg = f"❌ *[{action} FAILED]*\n• *Asset:* `{symbol}`\n• *Error:* `{e}`"
             logger.error(f"❌ [{action} FAILED] Strategy: {strategy_name} | Asset: {symbol} | Error: {e}")
-            await self.notify(fail_msg)
 
     async def process_pair_trading(
         self, df_dict: Dict[str, pd.DataFrame], current_equity: float
@@ -517,9 +609,12 @@ class AlgorithmicTradingEngine:
 
                 self.display_portfolio_and_market_tables(df_dict, account_data, positions)
 
+                # Software-level risk backup check
+                await self.process_software_stop_loss_guardrail(positions, df_dict, current_equity)
+
                 now_ts = asyncio.get_event_loop().time()
                 if self.last_hourly_report_time == 0.0 or (now_ts - self.last_hourly_report_time) >= 3600:
-                    await self.send_hourly_portfolio_report(account_data, positions)
+                    await self.send_hourly_portfolio_report(account_data, positions, df_dict)
                     self.last_hourly_report_time = now_ts
 
                 await self.process_trend_and_mean_reversion(df_dict, current_equity)
